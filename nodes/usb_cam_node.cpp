@@ -54,7 +54,8 @@ public:
   image_transport::CameraPublisher image_pub_;
 
   // parameters
-  std::string video_device_name_, io_method_name_, pixel_format_name_, camera_name_, camera_info_url_;
+  std::string video_device_name_, io_method_name_, pixel_format_name_, camera_name_, camera_info_url_, camera_sync_topic_;
+
   //std::string start_service_name_, start_service_name_;
   bool streaming_status_;
   int image_width_, image_height_, framerate_, exposure_, brightness_, contrast_, saturation_, sharpness_, focus_,
@@ -116,6 +117,7 @@ public:
     node_.param("camera_frame_id", img_.header.frame_id, std::string("head_camera"));
     node_.param("camera_name", camera_name_, std::string("head_camera"));
     node_.param("camera_info_url", camera_info_url_, std::string(""));
+    node_.param("camera_sync_topic", camera_sync_topic_, std::string(""));
     cinfo_.reset(new camera_info_manager::CameraInfoManager(node_, camera_name_, camera_info_url_));
 
     // create Services
