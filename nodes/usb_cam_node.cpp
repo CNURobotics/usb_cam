@@ -40,6 +40,7 @@
 #include <camera_info_manager/camera_info_manager.h>
 #include <sstream>
 #include <std_srvs/Empty.h>
+#include <geometry_msgs/PoseStamped.h>
 
 namespace usb_cam {
 
@@ -53,8 +54,19 @@ public:
   sensor_msgs::Image img_;
   image_transport::CameraPublisher image_pub_;
 
+  ros::Subscriber sync_sub_;
+  ros::Publisher  sync_pub_;
+  ros::Publisher  sync_data_pub_;
+  geometry_msgs::PoseStamped sync_data_;
+
+
   // parameters
   std::string video_device_name_, io_method_name_, pixel_format_name_, camera_name_, camera_info_url_, camera_sync_topic_;
+  double camera_sync_threshold_, camera_sync_max_adjustment_,average_sync_diff_;
+  ros::Time  desired_target_;
+  ros::Duration adjust_sync_;
+  bool camera_publish_sync_ = false;
+
 
   //std::string start_service_name_, start_service_name_;
   bool streaming_status_;
@@ -62,6 +74,7 @@ public:
       white_balance_, gain_;
   bool autofocus_, autoexposure_, auto_white_balance_;
   boost::shared_ptr<camera_info_manager::CameraInfoManager> cinfo_;
+  bool grab_image_;
 
   UsbCam cam_;
 
@@ -118,6 +131,12 @@ public:
     node_.param("camera_name", camera_name_, std::string("head_camera"));
     node_.param("camera_info_url", camera_info_url_, std::string(""));
     node_.param("camera_sync_topic", camera_sync_topic_, std::string(""));
+    node_.param("camera_sync_threshold", camera_sync_threshold_, 0.01/framerate_); // 1% of desired framerate
+    node_.param("camera_sync_max_adjustment", camera_sync_max_adjustment_, 0.5/framerate_); // 50% of desired framerate
+    node_.param("camera_publish_sync", camera_publish_sync_, false);
+
+    average_sync_diff_ = 0.0;
+
     cinfo_.reset(new camera_info_manager::CameraInfoManager(node_, camera_name_, camera_info_url_));
 
     // create Services
@@ -221,6 +240,28 @@ public:
         cam_.set_v4l_parameter("focus_absolute", focus_);
       }
     }
+
+    grab_image_ = true;
+
+    if (camera_sync_topic_ != "")
+    {
+        if (camera_publish_sync_)
+        {
+           sync_pub_ = node_.advertise<std_msgs::Header>(camera_sync_topic_,5);
+           ROS_INFO(" Advertise camera sync topic <%s>",camera_sync_topic_.c_str());
+        }
+        else
+        {
+           sync_sub_ = node_.subscribe(camera_sync_topic_,10,&UsbCamNode::sync_callback,this);
+           ROS_INFO(" Subscribe to camera sync topic <%s>",camera_sync_topic_.c_str());
+           sync_data_pub_ = node_.advertise<geometry_msgs::PoseStamped>(camera_sync_topic_+"_data",5);
+           ROS_INFO(" Advertise camera sync data topic <%s_data>",camera_sync_topic_.c_str());
+        }
+    }
+    else
+    {
+        camera_publish_sync_ = false;
+    }
   }
 
   virtual ~UsbCamNode()
@@ -240,30 +281,137 @@ public:
 
     // publish the image
     image_pub_.publish(img_, *ci);
+    if (camera_publish_sync_)
+    {
+        sync_pub_.publish(img_.header);
+    }
 
     return true;
   }
 
   bool spin()
   {
-    ros::Rate loop_rate(this->framerate_);
-    while (node_.ok())
-    {
-      if (cam_.is_capturing()) {
-        if (!take_and_send_image()) ROS_WARN("USB camera did not respond in time.");
-      }
-      ros::spinOnce();
-      loop_rate.sleep();
+    if (camera_sync_topic_== "" || camera_publish_sync_ == true)
+    { // Standard operation
+        ros::Rate loop_rate(this->framerate_);
+        while (node_.ok())
+        {
+          if (cam_.is_capturing()) {
+            if (!take_and_send_image()) ROS_WARN("USB camera did not respond in time.");
+          }
+          ros::spinOnce();
+          loop_rate.sleep();
+
+        }
+        return true;
+    }
+    else
+    { // Calculate the cycle time in order to remain approximately synchronized with another camera
+
+        ros::Rate loop_rate(2000);
+
+        while (node_.ok())
+        {
+          if (cam_.is_capturing()) {
+            if (ros::Time::now() >= desired_target_)
+            {
+                grab_image_ = false; // already grabbed the image corresponding to the prior target
+                if (!take_and_send_image()) ROS_WARN("USB camera did not respond in time.");
+
+                desired_target_ = cam_.last_sent() + ros::Duration(2.0/framerate_);      // set target for next grab at half desired rate (twice time period) - expect sync to correct first
+                sync_data_.pose.position.x += 1.0;
+                sync_data_.pose.position.y += loop_rate.cycleTime().toSec();
+                sync_data_.pose.position.z += loop_rate.expectedCycleTime().toSec();
+                sync_data_.header.stamp = ros::Time::now();
+                sync_data_pub_.publish(geometry_msgs::PoseStamped(sync_data_));
+                sync_data_ = geometry_msgs::PoseStamped();
+            }
+            else
+            {
+                sync_data_.pose.position.x += 1.0;
+                sync_data_.pose.position.y += loop_rate.cycleTime().toSec();
+                sync_data_.pose.position.z += loop_rate.expectedCycleTime().toSec();
+            }
+          }
+          ros::spinOnce(); // this is where the sync call back is processed
+          loop_rate.sleep();
+
+        }
+        return true;
 
     }
-    return true;
   }
 
 
+  inline void sync_callback(const std_msgs::Header::ConstPtr& msg)
+  {
+      // This is called upon receipt of sync message from the master camera
+      // There are two cases we will consider
+      // either 1) we got a new sync message after we send out our latest,
+      //  or    2) we get the sync while waiting up send our corresponding image
 
 
+      //ROS_INFO(" received sync topic = %f",msg->stamp.toSec());
+      double diff = (msg->stamp - cam_.last_sent()).toSec();
+      double raw_diff = diff;
+      if (fabs(diff) < camera_sync_threshold_)
+      { // must have just grabbed, so we are doing well
 
 
+          average_sync_diff_ = 0.9*average_sync_diff_ + 0.1*diff;
+          adjust_sync_       = ros::Duration(average_sync_diff_);
+          desired_target_ = msg->stamp + ros::Duration(1.0/framerate_) + adjust_sync_; // reset the target so that we match the master camera
+          grab_image_  = true;  // Need to grab the corresponding image
+      }
+      else if (diff > 0.0)
+      {
+          // It is possible that we grabbed slightly ahead of the master based on sync, in which case diff is positive, but we don't need to grab
+          // Use the grab_image_ flag to disambiguate the conditions
+
+          // we are expected to grab soon
+          if (cam_.is_capturing() && grab_image_) {
+                if (!take_and_send_image())
+                {
+                            ROS_WARN("USB camera did not respond in time.");
+                }
+                diff = (msg->stamp - cam_.last_sent()).toSec(); // this will be negative, which implies grab earlier next time to compensate for lag
+                average_sync_diff_ = 0.9*average_sync_diff_ + 0.1*diff;
+                adjust_sync_       = ros::Duration(average_sync_diff_);
+                desired_target_ = msg->stamp + ros::Duration(1.0/framerate_) + adjust_sync_; // specify the target for next grab
+                grab_image_     = true; // flag to grab the next image
+
+                sync_data_.header.stamp = ros::Time::now();
+                sync_data_pub_.publish(geometry_msgs::PoseStamped(sync_data_));
+                sync_data_ = geometry_msgs::PoseStamped();
+          }
+      }
+      else
+      {   // means camera master grabbed earlier, assuming we don't have a significant comms transport delay  then  need to debug
+
+          if (diff < -camera_sync_max_adjustment_)
+          {
+              ROS_WARN("Camera  sync diff=%f < threshold (avg=%f) - desired_target = %f = significant offset - reset tuning sync=%f offset=%f",diff, average_sync_diff_, desired_target_.toSec(),msg->stamp.toSec(),adjust_sync_.toSec());
+              desired_target_ = msg->stamp + ros::Duration(1.0/framerate_);
+              grab_image_     = true;
+              adjust_sync_     = ros::Duration();
+              average_sync_diff_ = 0.0; // reset
+          }
+          else
+          {
+              // Somewhere between really late comms and good sync; presume our sync is working
+              average_sync_diff_ = 0.9*average_sync_diff_ + 0.1*diff;
+              adjust_sync_       = ros::Duration(1.1*average_sync_diff_); // slightly over correct
+              desired_target_ = msg->stamp + ros::Duration(1.0/framerate_)  + adjust_sync_;
+              grab_image_     = true;
+          }
+      }
+
+      sync_data_.pose.orientation.x = average_sync_diff_;
+      sync_data_.pose.orientation.y = adjust_sync_.toSec();
+      sync_data_.pose.orientation.z = diff;
+      sync_data_.pose.orientation.w = raw_diff;
+
+  }
 };
 
 }

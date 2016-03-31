@@ -1077,9 +1077,11 @@ void UsbCam::shutdown(void)
 void UsbCam::grab_image(sensor_msgs::Image* msg)
 {
   // grab the image
+  last_sent_ = ros::Time::now();
   grab_image();
+
   // stamp the image
-  msg->header.stamp = ros::Time::now();
+  msg->header.stamp = last_sent_;
   // fill the info
   if (monochrome_)
   {
@@ -1238,5 +1240,6 @@ UsbCam::pixel_format UsbCam::pixel_format_from_string(const std::string& str)
     else
       return PIXEL_FORMAT_UNKNOWN;
 }
+
 
 }

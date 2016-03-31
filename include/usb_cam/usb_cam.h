@@ -96,6 +96,7 @@ class UsbCam {
   void stop_capturing(void);
   void start_capturing(void);
   bool is_capturing();
+  inline const ros::Time& last_sent(){return last_sent_;}
 
  private:
   typedef struct
@@ -146,6 +147,7 @@ class UsbCam {
   int avframe_rgb_size_;
   struct SwsContext *video_sws_;
   camera_image_t *image_;
+  ros::Time last_sent_;
 
 };
 
