@@ -6,6 +6,8 @@ This package is based off of V4L devices specifically instead of just UVC.
 
 For full documentation, see [the ROS wiki](http://ros.org/wiki/usb_cam).
 
+This version includes the ability to send a soft synchronization topic from one camera to others.  The cameras will attempt to grab their next image based on a desired framerate given the time stamp of the master camera.
+
 [Doxygen](http://docs.ros.org/indigo/api/usb_cam/html/) files can be found on the ROS wiki.
 
 ### License
